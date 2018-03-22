@@ -3,13 +3,26 @@ if (!global._babelPolyfill) {
 }
 const winston = require('winston');
 
-
-import { getDelta, pathsLoggedAlways, loggableObject, setActor, setAttributes, getTrace } from './util';
+import {
+  getSpath,
+  setSpath,
+  getDelta,
+  pathsLoggedAlways,
+  loggableObject,
+  setActor,
+  setAttributes,
+  getTrace
+} from './util';
 
 // reexporting for specs
-export { getDelta, pathsLoggedAlways, loggableObject, setActor, setAttributes };
+export {
+  getDelta,
+  pathsLoggedAlways,
+  loggableObject,
+  setActor,
+  setAttributes
+};
 
-import { getSpath, setSpath } from 'kal-dep-mapreduce-helper';
 export const Action = {
   deleted: 'deleted',
   created: 'created',
@@ -51,6 +64,26 @@ export function mergeOptions(defaults, current) {
   return res;
 }
 
+function cleanUpdateQuery(update) {
+    if (!update) return {};
+
+    let cleaned = {};
+    Object.keys(update).forEach(key => {
+      if (key === '$set') {
+        // if using set, pull it out of the inner object
+        cleaned = {
+          ...cleaned,
+          ...update[key],
+        };
+      }
+      // filter out mongo fields starting with $
+      if (key.charAt(0) !== '$') {
+        cleaned[key] = update[key];
+      }
+    });
+    return cleaned;
+}
+
 /**
  * Creates a Mongoose promise.
  */
@@ -69,16 +102,18 @@ function createMongoosePromise(mongooseInstance, resolver) {
 }
 export function patchQueryPrototype(mongooseInstance) {
   //  hack to ensure mongoose-deep-populate patch is applied first
-  require('mongoose-deep-populate')(mongooseInstance);
+  
+  require('mongoose-deep-populate')(mongooseInstance);  
   const Mongoose = Object.getPrototypeOf(mongooseInstance);
   const Query = mongooseInstance.Query;
   const _exec = Query.prototype.exec;
 
-  if (!Query.prototype._klLoggerPatched) {
+  if (!Query.prototype._klLoggerPatched) {    
     Query.prototype.by = function setQueryActor(actor) {
       this._klLoggerActor = actor;
       return this;
     };
+
       /**
      * Monkey-patches `exec` to add logger hook.
      * @param op the operation to be executed.
@@ -102,6 +137,7 @@ export function patchQueryPrototype(mongooseInstance) {
         cb = cb || (() => {});
       }
       const promise = createMongoosePromise(mongooseInstance, (resolve, reject) => {
+        
         _exec.call(this, op, (err, result) => {
           if (err) {
             cb(err);
@@ -154,14 +190,16 @@ export function patchDocumentPrototype(mongooseInstance) {
   const Document = mongooseInstance.Model;
 
   if (!Document.prototype._klLoggerPatched) {
-    Document.prototype._klLoggerPatched = true;
+    Document.prototype._klLoggerPatched = true;    
     const origRegisterHooksFromSchema = Document.prototype.$__registerHooksFromSchema;
     Document.prototype.$__registerHooksFromSchema = function klLoggerPluginPatchedHooksRegistration(...args) {
+      
       const registerHooksFromSchemaReturn = origRegisterHooksFromSchema.call(this, ...args);
       if (!this._klLoggerLoggerPatched) {
         this._klLoggerLoggerPatched = true;
         const origSave = this.save;
         const origRemove = this.remove;
+        const origFindOneAndUpdate = Document.findOneAndUpdate;
         this.save = function klLoggerPluginPatchedSave(_op, _cb) {
           let cb = _cb;
           let op = _op;
@@ -171,9 +209,10 @@ export function patchDocumentPrototype(mongooseInstance) {
             op = null;
           }
           const calls = getTrace();
-          if (calls.length) {
+          if (calls.length && !this._klLoggerStaticContext) {
             this._klLoggerSaveCallStack = calls;
           }
+          
           const promise = createMongoosePromise(mongooseInstance, (resolve, reject) => {
             origSave.call(this, op).then((savedDoc) => {
               if (calls.length) {
@@ -182,6 +221,7 @@ export function patchDocumentPrototype(mongooseInstance) {
               if (cb) {
                 cb(undefined, savedDoc);
               }
+              
               resolve(savedDoc);
             }).catch(error => {
               if (cb) {
@@ -198,6 +238,16 @@ export function patchDocumentPrototype(mongooseInstance) {
             this._klLoggerRemoveCallStack = calls;
           }
           return origRemove.call(this, ...removeArgs);
+        };
+
+        Document.findOneAndUpdate = function klLoggerPluginPatchedFindOneAndUpdate(...args) {
+          const calls = getTrace();
+          if (calls.length) {
+            // Save the callstack to the querys options because 'this' refers to the model
+            if (!args[2]) args[2] = {};
+            args[2]._klLoggerSaveCallStack = calls;
+          }
+          return origFindOneAndUpdate.call(this, ...args);
         };
       }
       return registerHooksFromSchemaReturn;
@@ -221,12 +271,9 @@ export function plugin(mongooseInstance) {
     }
     schema._klLoggerLogger = Logger;
     schema._klLoggerOptions = mOptions;
-    schema.pre('save', function preSave(next) {
-      this._klLoggerModifiedPaths = this.modifiedPaths();
-      this._klLoggerIsNew = this.isNew;
-      next();
-    });
-    schema.post('save', (savedDoc, done) => {
+
+
+    function postSave(savedDoc, done)  {
       const opts = savedDoc._klLoggerOptions || savedDoc.schema._klLoggerOptions || _options;
       const when = new Date();
       const modelName = savedDoc.constructor.modelName;
@@ -314,7 +361,56 @@ export function plugin(mongooseInstance) {
       return opts.logger.log({
         object: objectToLog, objectType, action, actor, when, attributes, callStack,
       }, done);
+    }
+
+    schema.pre('save', function preSave(next) {
+      this._klLoggerModifiedPaths = this.modifiedPaths();
+      this._klLoggerIsNew = this.isNew;
+      next();
     });
+
+    schema.pre('findOneAndUpdate', async function preUpdate(next) {
+      const search = this._conditions || {};
+      const options = this.options || {};
+      const updated = cleanUpdateQuery(this._update);
+      
+      const callstack = options._klLoggerSaveCallStack;
+      delete options._klLoggerSaveCallStack;      
+
+      const existing = await this.findOne(search);
+      if (existing) {
+        this._klLoggerInitialDoc = existing.loggableObject();
+      }
+
+      this._klLoggerIsNew = !existing && options.upsert;
+      this._klLoggerQuery = {
+        ...search,
+        ...updated,
+      };
+      this._klLoggerReturnsNew = options.new;
+      this._klLoggerSaveCallStack = callstack;
+      next();
+    });
+
+    schema.post('findOneAndUpdate', async function(result, done) {
+      try {
+        if (!this._klLoggerReturnsNew) {
+          result = await this.findOne(this._klLoggerQuery);
+        }
+      
+        if (!result) return done();
+      
+        result._klLoggerIsNew = this._klLoggerIsNew;
+        result._klLoggerInitialDoc = this._klLoggerInitialDoc;
+        result._klLoggerActor = this._klLoggerActor;
+        result._klLoggerSaveCallStack = this._klLoggerSaveCallStack;
+
+        postSave(result, done);
+      } catch (err) {
+        return done(err);
+      }
+    });  
+    schema.post('save', postSave);
     schema.post('remove', (removedDoc, done) => {
       const opts = removedDoc.loggingOptions() || removedDoc.schema._klLoggerOptions || _options;
       const when = new Date();
@@ -367,8 +463,8 @@ export function plugin(mongooseInstance) {
       return this;
     };
     schema.statics.setLoggingOptions = function modelStaticSetLoggingOptions(opts) {
-      const moptions = mergeOptions(this._klLoggerOptions || _options, opts);
-      this._klLoggerOptions = moptions;
+      const moptions = mergeOptions(this.schema._klLoggerOptions || _options, opts);
+      this.schema._klLoggerOptions = moptions;
     };
     schema.statics.loggingOptions = function modelStaticLoggingOptions() {
       const opts = this._klLoggerOptions || _options;
