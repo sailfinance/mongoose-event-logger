@@ -1,5 +1,5 @@
-const host = process.env.MONGO_PORT_27017_TCP_ADDR || 'int-db.kentandlime.com.au';
-const port = process.env.MONGO_PORT_27017_TCP_PORT || 27017;
+const host = process.env.EVENTS_LOGGER_DB_HOST || 'localhost';
+const port = process.env.EVENTS_LOGGER_DB_HOST_PORT || 27017;
 
 module.exports = {
   url: `mongodb://${host}:${port}/event-log`,
